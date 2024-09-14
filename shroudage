@@ -1,0 +1,231 @@
+#!/bin/bash
+
+set -e
+set -u
+set -o pipefail
+
+_README=$(cat <<'EOF'
+# [shroudage](https://github.com/nxsy/shroudage)
+
+shroudage is a simple shell script wrapper around `age` for use as a git
+filter to transparently encrypt/decrypt contents - storing files encrypted
+in the repository, but unencrypted in your working copy.
+
+Use of this requires vigilance to ensure these filters are acting as
+intended, so check any commits before pushing.
+
+## Using
+
+Run `shroudage init` to set up your repository - whether it is newly-created
+or newly-checked out.  On first use on a repository, it will generate a
+passphrase-encrypted key, and set up a `.gitattributes` file (if one does
+not exist already) to handle files in the `content` directory.  In all
+cases, it will decrypt this encrypted key locally, and configure git
+filters.
+
+This will copy this script into your repository at `.scripts`, so you do
+not need anything external to the repository in future.
+
+If you're checking out a repository, you'll want to run `git restore .`
+after init to force decryption of the working copy (which would be the
+encrypted contents in the initial checkout).
+
+## Validating
+
+After staging a change, use `git diff --staged --no-textconv` to see what
+will be in your commit.  Use `git show --no-textconv` to see what your
+commit looks like in the local repository before pushing elsewhere.
+
+## Testing
+
+If you have checked out the shroudage repository, it is using shroudage
+itself.  Look at `content/README.md` for the encrypted contents in the
+working directory, and then run `./shroudage init` to update the repository
+git filters (the key's passphrase is `unsecure`).  After running `git restore
+content`, you should now see the unencrypted contents in `content/README.md`:
+
+    This should be encrypted in the repository.
+EOF
+)
+
+_LICENSE=$(cat <<'EOF'
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <https://unlicense.org>
+EOF
+)
+
+# This is where shroudage expects to live in the repo.  If you somehow run
+# it in a repo where it isn't here, it'll copy itself here.
+SHROUDAGE_PATH=".scripts/shroudage"
+UNPROTECTED_KEY_FILE=".git/unprotected_key.age"
+ENCRYPTED_KEY_FILE="key.age"
+RECIPIENTS_FILE="age.recipients"
+
+if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+    echo "Must be run from within a Git repository."
+    exit 1
+fi
+
+if ! command -v age &> /dev/null; then
+    echo "age could not be found, install it first!" >&2
+    exit 1
+fi
+
+clean() {
+    # The `clean` filter is used to encrypt the file before it is added to the
+    # repository.
+    #
+    # We use the filename to get the encrypted contents from the repository,
+    # and if the decrypted contents are the same, we'll return the contents
+    # from the repository rather than encrypting ourselves, otherwise we'll
+    # end up with git thinking the files are constantly changing on content
+    # received during git operations.
+
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: $0 clean <filename>" >&2
+        exit 1
+    fi
+
+    filename="$1"
+    input=$(cat)
+
+    # Get the encrypted contents from the repository
+    repo_contents=$(git show HEAD:"$filename" 2>/dev/null || echo "")
+
+    if [[ -n "$repo_contents" ]]; then
+        decrypted_repo_contents=$(echo "$repo_contents" | age -d -i "$UNPROTECTED_KEY_FILE" 2>/dev/null)
+
+        if [[ "$input" == "$decrypted_repo_contents" ]]; then
+            echo "$repo_contents"
+            return
+        fi
+    fi
+
+    # If different or file doesn't exist in repo, encrypt the input
+    echo "$input" | age -R "$RECIPIENTS_FILE" -a
+}
+
+smudge() {
+    # The `smudge` filter is used to decrypt the file from the repository into
+    # the working copy.
+
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: $0 smudge <filename>" >&2
+        exit 1
+    fi
+    age -d -i "$UNPROTECTED_KEY_FILE" 2>/dev/null
+}
+
+textconv() {
+    # The `textconv` filter is used to decrypt the file when it is diffed.
+    # This is useful for seeing the plaintext changes in a diff.
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: $0 textconv <filename>" >&2
+        exit 1
+    fi
+    filename="$1"
+
+    (age -d -i "$UNPROTECTED_KEY_FILE" "${filename}" 2>/dev/null) || (
+        cat "${filename}"
+    )
+}
+
+# Function to generate a new key pair
+generate_new_key() {
+    private_key="$(age-keygen 2> /dev/null)"
+    public_key=$(echo "$private_key" | age-keygen -y)
+    echo "Enter a passphrase to protect your key:"
+    echo "$private_key" | age -p --armor -o "${ENCRYPTED_KEY_FILE}"
+    echo "$public_key" > "${RECIPIENTS_FILE}"
+    echo "$private_key" > "${UNPROTECTED_KEY_FILE}"
+}
+
+update() {
+    cd "$(git rev-parse --show-toplevel)"
+
+    mkdir -p "$(dirname ${SHROUDAGE_PATH})"
+    cp "${BASH_SOURCE[0]}" "${SHROUDAGE_PATH}"
+}
+
+init() {
+    cd "$(git rev-parse --show-toplevel)"
+
+    chmod 700 .
+
+    if [ ! -f "${ENCRYPTED_KEY_FILE}" ]; then
+        echo "Generating a new key..."
+        generate_new_key
+    fi
+
+    if [ ! -f "${UNPROTECTED_KEY_FILE}" ]; then
+        echo "Enter the passphrase for ${ENCRYPTED_KEY_FILE} to extract the unprotected key:"
+        age -d -o "${UNPROTECTED_KEY_FILE}" "${ENCRYPTED_KEY_FILE}"
+    fi
+
+    if [ ! -f "${SHROUDAGE_PATH}" ]; then
+        mkdir -p "$(dirname ${SHROUDAGE_PATH})"
+        cp "${BASH_SOURCE[0]}" "${SHROUDAGE_PATH}"
+    fi
+
+    git config filter.shroudage.clean "${SHROUDAGE_PATH} clean %f"
+    git config filter.shroudage.smudge "${SHROUDAGE_PATH} smudge %f"
+
+    git config diff.shroudage.textconv "${SHROUDAGE_PATH} textconv"
+
+    attributes_content="content/** filter=shroudage diff=shroudage"
+
+    if [ ! -f .gitattributes ]; then
+        echo "${attributes_content}" > .gitattributes
+    else
+        if ! grep -F "${attributes_content}" .gitattributes > /dev/null 2>&1 ; then
+            echo ".gitattributes already exists, ensure it contains the configuration you desire for the filters, such as:"
+            echo "    ${attributes_content}"
+        fi
+    fi
+
+    echo "All done!"
+}
+
+readme() {
+    echo "${_README}"
+}
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <subcommand> [<filename>]"
+    exit 1
+fi
+
+subcommand="$1"
+shift
+
+case "$subcommand" in
+    clean|smudge|textconv|init|readme|update)
+        "$subcommand" "$@"
+        ;;
+    *)
+        echo "Unknown subcommand: $subcommand"
+        exit 1
+        ;;
+esac
